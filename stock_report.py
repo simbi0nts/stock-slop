@@ -70,7 +70,7 @@ MOEX_CANDLES = "https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQB
 # наборе Python, поэтому корневой сертификат лежит в репозитории: certs/russian_trusted_root_ca.pem
 RU_CA_FILE = os.getenv(
     "RU_ROOT_CA",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "certs", "russian_trusted_root_ca.pem"),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "certs", "russian_trusted_root_ca_pem.crt"),
 )
 
 # Торговые дни назад для недели / месяца / года (акции ~5/21/252, BTC торгуется ежедневно)
