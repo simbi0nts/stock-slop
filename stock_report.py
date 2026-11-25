@@ -6,6 +6,7 @@
 2. Один вызов Claude с веб-поиском собирает свежие новости (на русском).
 3. N независимых вызовов Claude (параллельно) оценивают движение на день и сигнал по BTC.
 4. Результаты агрегируются (медиана / голосование) и уходят в Telegram.
+   Блоки «Продаём» — бумаги, где падение ждёт большинство прогонов.
 
 Обязательные env: ANTHROPIC_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 Необязательные env: N_RUNS, NEWS_MODEL, PREDICT_MODEL, TICKERS (US), LOCAL_TICKERS (MOEX),
@@ -34,7 +35,7 @@ import yfinance as yf
 
 # ----------------------------- Config ---------------------------------------
 
-N_RUNS = int(os.getenv("N_RUNS", "10"))
+N_RUNS = max(1, int(os.getenv("N_RUNS", "10")))
 NEWS_MODEL = os.getenv("NEWS_MODEL", "claude-haiku-5-5")
 PREDICT_MODEL = os.getenv("PREDICT_MODEL", "claude-haiku-5-5")
 TZ = ZoneInfo(os.getenv("REPORT_TZ", "Europe/Moscow"))
@@ -314,7 +315,8 @@ def log(msg: str) -> None:
 
 
 def pct(new: float, old: float) -> float:
-    return (new / old - 1) * 100
+    """Изменение new к old в процентах. Нулевая база не роняет отчёт."""
+    return (new / old - 1) * 100 if old else 0.0
 
 
 def build_rows(close: pd.DataFrame) -> dict:
@@ -387,18 +389,29 @@ def moex_verify():
     return bundle
 
 
-def moex_series(t: str, start: date, end: date, verify=True):
+def moex_series(t: str, start: date, end: date, verify=True, attempts: int = 2) -> pd.Series | None:
     """Дневные закрытия одной бумаги с Мосбиржи (ISS). None, если данных нет."""
-    r = requests.get(
-        MOEX_CANDLES.format(t=t),
-        params={"from": start.isoformat(), "till": end.isoformat(),
-                "interval": 24, "iss.meta": "off"},
-        headers={"User-Agent": "Mozilla/5.0 (compatible; stock-slop/1.0)"},
-        verify=verify,
-        timeout=20,
-    )
-    r.raise_for_status()
-    c = r.json()["candles"]
+    last_err = None
+    for attempt in range(attempts):
+        try:
+            r = requests.get(
+                MOEX_CANDLES.format(t=t),
+                params={"from": start.isoformat(), "till": end.isoformat(),
+                        "interval": 24, "iss.meta": "off"},
+                headers={"User-Agent": "Mozilla/5.0 (compatible; stock-slop/1.0)"},
+                verify=verify,
+                timeout=20,
+            )
+            r.raise_for_status()
+            c = r.json()["candles"]
+            break
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            if attempt + 1 < attempts:
+                time.sleep(2 * (attempt + 1))
+    else:
+        raise last_err
+
     if not c["data"]:
         return None
     df = pd.DataFrame(c["data"], columns=c["columns"])
@@ -438,6 +451,20 @@ def split_top_worst(items: list):
     return items[:k], items[::-1][:k]
 
 
+def split_sell(items: list, expected: dict, down_share: dict) -> list:
+    """Бумаги, у которых больше всего шансов продолжить падение.
+
+    Сортируем по доле прогонов с отрицательным прогнозом, при равенстве — по
+    величине ожидаемого минуса. Берём только те, где минус ждёт большинство.
+    """
+    candidates = [
+        r for r in items
+        if (expected.get(r["ticker"]) or 0) < 0 and (down_share.get(r["ticker"]) or 0) > 0.5
+    ]
+    candidates.sort(key=lambda r: (-down_share[r["ticker"]], expected[r["ticker"]]))
+    return candidates[:TOP_N]
+
+
 # ----------------------------- Claude helpers -------------------------------
 
 
@@ -460,7 +487,10 @@ def ask_claude(client, model, system, user, tools=None, max_tokens=3000) -> str:
             messages.append({"role": "assistant", "content": resp.content})
             continue
         break
-    return "".join(b.text for b in resp.content if b.type == "text")
+    text = "".join(b.text for b in resp.content if b.type == "text")
+    if not text.strip():
+        raise RuntimeError(f"empty reply from model (stop_reason={resp.stop_reason})")
+    return text
 
 
 def ask_json(client, *args, retries=2, **kwargs) -> dict:
@@ -498,13 +528,15 @@ def gather_news(client, picks: list, now: datetime) -> list:
     except Exception as e:  # noqa: BLE001
         log(f"News step failed: {e}")
         return []
-    items = []
+    items, seen = [], set()
     for n in data.get("news", []):
         if not isinstance(n, dict):
             continue
         url, headline = str(n.get("url", "")), str(n.get("headline", "")).strip()
-        if url.startswith(("http://", "https://")) and headline:
-            items.append({**n, "url": url, "headline": headline[:120]})
+        if not url.startswith(("http://", "https://")) or not headline or url in seen:
+            continue
+        seen.add(url)
+        items.append({**n, "url": url, "headline": headline[:120]})
     return items
 
 
@@ -543,7 +575,7 @@ def num(x):
 
 
 def aggregate(runs: list, tickers: list) -> dict:
-    expected = {}
+    expected, down_share = {}, {}
     for t in tickers:
         vals = []
         for r in runs:
@@ -553,6 +585,8 @@ def aggregate(runs: list, tickers: list) -> dict:
             if v is not None:
                 vals.append(v)
         expected[t] = statistics.median(vals) if vals else None
+        # Доля прогонов, которые ждут падение: «шанс, что бумага пойдёт вниз».
+        down_share[t] = sum(v < 0 for v in vals) / len(vals) if vals else None
 
     btc_runs = []
     for r in runs:
@@ -561,7 +595,7 @@ def aggregate(runs: list, tickers: list) -> dict:
         if sig in SIGNALS:
             btc_runs.append((sig, num(b.get("expected_day_pct")), str(b.get("reason", "")).strip()))
 
-    result = {"expected": expected, "btc_expected": None,
+    result = {"expected": expected, "down_share": down_share, "btc_expected": None,
               "signal": None, "confidence": None, "reason": ""}
     if not btc_runs:
         return result
@@ -625,20 +659,26 @@ def stock_block(emoji: str, title: str, items: list, expected: dict, rub: bool) 
     return "\n".join(lines)
 
 
-def build_message(now, us_top, us_worst, ru_top, ru_worst, btc, agg, news,
-                  quote=None, ru_failed=False) -> str:
+def build_message(now, us_top, us_worst, us_sell, ru_top, ru_worst, ru_sell,
+                  btc, agg, news, quote=None, ru_failed=False) -> str:
     quote = quote or random.choice(QUOTES)
     exp = agg["expected"]
 
-    def assemble(news_count: int) -> str:
+    def assemble(news_count: int, item_limit: int) -> str:
         parts = [f"📊 <b>Слоп Отчёт</b> · {ru_date(now)} {TZ_LABEL}"]
-        if us_top:
-            parts.append(stock_block("🟢", "Покупаем забугорные акции", us_top, exp, rub=False))
-            parts.append(stock_block("🔴", "Не покупаем забугорные акции", us_worst, exp, rub=False))
-        if ru_top:
-            parts.append(stock_block("🟢", "Покупаем местные акции", ru_top, exp, rub=True))
-            parts.append(stock_block("🔴", "Не покупаем местные акции", ru_worst, exp, rub=True))
-        elif ru_failed:
+        blocks = [
+            ("🟢", "Покупаем забугорные акции", us_top, False),
+            ("🔴", "Не покупаем забугорные акции", us_worst, False),
+            ("💰", "Продаём забугорные акции", us_sell, False),
+            ("🟢", "Покупаем местные акции", ru_top, True),
+            ("🔴", "Не покупаем местные акции", ru_worst, True),
+            ("💰", "Продаём местные акции", ru_sell, True),
+        ]
+        for emoji, title, items, rub in blocks:
+            picked = items[:item_limit]
+            if picked:
+                parts.append(stock_block(emoji, title, picked, exp, rub=rub))
+        if ru_failed:
             parts.append("⚠️ <i>Местные акции: Мосбиржа не отдала данные, смотри лог</i>")
 
         btc_exp = fmt_pct(agg["btc_expected"]) if agg["btc_expected"] is not None else "н/д"
@@ -663,12 +703,16 @@ def build_message(now, us_top, us_worst, ru_top, ru_worst, btc, agg, news,
         parts.append(f"<i>«{esc(quote)}» — Стетхем</i>")
         return "\n\n".join(parts)
 
-    # Не больше 5 новостей, и сокращаем их, если сообщение не влезает в лимит Telegram.
-    text = assemble(0)
-    for count in range(min(5, len(news)), -1, -1):
-        text = assemble(count)
-        if len(text) <= TG_LIMIT:
-            break
+    # Сначала убираем новости, потом сокращаем списки бумаг — чтобы влезть в лимит Telegram.
+    text = ""
+    for item_limit in range(TOP_N, 0, -1):
+        for count in range(min(5, len(news)), -1, -1):
+            text = assemble(count, item_limit)
+            if len(text) <= TG_LIMIT:
+                if item_limit < TOP_N:
+                    log(f"Report trimmed to {item_limit} stocks per block to fit Telegram")
+                return text
+    log(f"Report is {len(text)} chars, over the {TG_LIMIT} limit even after trimming")
     return text
 
 
@@ -709,7 +753,8 @@ def main() -> None:
         "as_of": f"{now:%Y-%m-%d %H:%M} {TZ_LABEL}",
         "stocks": [rnd(r, market="US") for r in us_picks] + [rnd(r, market="RU") for r in ru_picks],
         "btc": rnd(btc),
-        "news": [{k: n.get(k) for k in ("headline", "tickers", "impact")} for n in news],
+        "news": [{k: n.get(k) for k in ("headline", "tickers", "impact") if n.get(k) is not None}
+                 for n in news],
     }
     with ThreadPoolExecutor(max_workers=N_RUNS) as pool:
         results = list(pool.map(lambda i: run_prediction(client, i, payload), range(N_RUNS)))
@@ -718,8 +763,10 @@ def main() -> None:
         sys.exit("All prediction runs failed; nothing to send.")
 
     agg = aggregate(runs, [r["ticker"] for r in picks])
-    text = build_message(now, us_top, us_worst, ru_top, ru_worst, btc, agg, news,
-                         ru_failed=not ru_rows)
+    us_sell = split_sell(us_picks, agg["expected"], agg["down_share"])
+    ru_sell = split_sell(ru_picks, agg["expected"], agg["down_share"])
+    text = build_message(now, us_top, us_worst, us_sell, ru_top, ru_worst, ru_sell,
+                         btc, agg, news, ru_failed=not ru_rows)
 
     if DRY_RUN:
         print(text)
