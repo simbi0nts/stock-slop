@@ -2,9 +2,8 @@ name: Market Pulse
 
 on:
   schedule:
-    # Every 3 hours, UTC. 00:00 UTC = 03:00 Moscow time.
-    - cron: "0 */3 * * *"
-  workflow_dispatch: # lets you run it manually from the Actions tab
+    - cron: "17 */3 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
