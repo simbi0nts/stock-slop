@@ -19,10 +19,12 @@ import os
 import random
 import statistics
 import sys
+import tempfile
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
+from functools import lru_cache
 from zoneinfo import ZoneInfo
 
 import anthropic
@@ -63,6 +65,13 @@ US_UNIVERSE = tickers_from_env("TICKERS", DEFAULT_US)
 RU_UNIVERSE = tickers_from_env("LOCAL_TICKERS", DEFAULT_RU)
 
 MOEX_CANDLES = "https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities/{t}/candles.json"
+
+# Мосбиржа использует сертификаты НУЦ Минцифры (Russian Trusted Root CA). Их нет в стандартном
+# наборе Python, поэтому корневой сертификат лежит в репозитории: certs/russian_trusted_root_ca.pem
+RU_CA_FILE = os.getenv(
+    "RU_ROOT_CA",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "certs", "russian_trusted_root_ca.pem"),
+)
 
 # Торговые дни назад для недели / месяца / года (акции ~5/21/252, BTC торгуется ежедневно)
 STOCK_OFFSETS = {"week": 5, "month": 21, "year": 252}
@@ -167,12 +176,33 @@ def fetch_us_and_btc() -> dict:
     return rows
 
 
-def moex_series(t: str, start: date, end: date):
+@lru_cache(maxsize=1)
+def moex_verify():
+    """Набор доверенных сертификатов для Мосбиржи: стандартный (certifi) + корень Минцифры.
+
+    Проверка TLS остаётся включённой. Набор применяется только к запросам к Мосбирже.
+    """
+    if not os.path.isfile(RU_CA_FILE):
+        log(f"MOEX: нет файла {RU_CA_FILE}, проверка сертификата Мосбиржи, скорее всего, не пройдёт")
+        return True
+    import certifi
+
+    bundle = os.path.join(tempfile.mkdtemp(), "ca-bundle.pem")
+    with open(bundle, "wb") as out:
+        for path in (certifi.where(), RU_CA_FILE):
+            with open(path, "rb") as f:
+                out.write(f.read().rstrip() + b"\n")
+    return bundle
+
+
+def moex_series(t: str, start: date, end: date, verify=True):
     """Дневные закрытия одной бумаги с Мосбиржи (ISS). None, если данных нет."""
     r = requests.get(
         MOEX_CANDLES.format(t=t),
         params={"from": start.isoformat(), "till": end.isoformat(),
                 "interval": 24, "iss.meta": "off"},
+        headers={"User-Agent": "Mozilla/5.0 (compatible; stock-slop/1.0)"},
+        verify=verify,
         timeout=20,
     )
     r.raise_for_status()
@@ -189,12 +219,13 @@ def fetch_ru() -> dict:
     """Российские акции. Если Мосбиржа недоступна, отчёт уходит без этих блоков."""
     end = date.today()
     start = end - timedelta(days=400)
+    verify = moex_verify()
 
     def one(t):
         try:
-            return t, moex_series(t, start, end)
+            return t, moex_series(t, start, end, verify)
         except Exception as e:  # noqa: BLE001
-            log(f"MOEX {t} failed: {e}")
+            log(f"MOEX {t} failed: {str(e)[:200]}")
             return t, None
 
     series = {}
@@ -402,7 +433,8 @@ def stock_block(emoji: str, title: str, items: list, expected: dict, rub: bool) 
     return "\n".join(lines)
 
 
-def build_message(now, us_top, us_worst, ru_top, ru_worst, btc, agg, news, quote=None) -> str:
+def build_message(now, us_top, us_worst, ru_top, ru_worst, btc, agg, news,
+                  quote=None, ru_failed=False) -> str:
     quote = quote or random.choice(QUOTES)
     exp = agg["expected"]
 
@@ -414,6 +446,8 @@ def build_message(now, us_top, us_worst, ru_top, ru_worst, btc, agg, news, quote
         if ru_top:
             parts.append(stock_block("🟢", "Покупаем местные акции", ru_top, exp, rub=True))
             parts.append(stock_block("🔴", "Не покупаем местные акции", ru_worst, exp, rub=True))
+        elif ru_failed:
+            parts.append("⚠️ <i>Местные акции: Мосбиржа не отдала данные, смотри лог</i>")
 
         btc_exp = fmt_pct(agg["btc_expected"]) if agg["btc_expected"] is not None else "н/д"
         btc_lines = [
@@ -492,7 +526,8 @@ def main() -> None:
         sys.exit("All prediction runs failed; nothing to send.")
 
     agg = aggregate(runs, [r["ticker"] for r in picks])
-    text = build_message(now, us_top, us_worst, ru_top, ru_worst, btc, agg, news)
+    text = build_message(now, us_top, us_worst, ru_top, ru_worst, btc, agg, news,
+                         ru_failed=not ru_rows)
 
     if DRY_RUN:
         print(text)
