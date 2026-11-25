@@ -42,7 +42,7 @@ TZ = ZoneInfo(os.getenv("REPORT_TZ", "Europe/Moscow"))
 TZ_LABEL = os.getenv("REPORT_TZ_LABEL", "MSK")
 DRY_RUN = os.getenv("DRY_RUN") == "1"
 
-TOP_N = 5
+TOP_N = 3
 BTC_TICKER = "BTC-USD"
 TG_LIMIT = 4000  # у Telegram лимит 4096 символов, берём с запасом
 
@@ -648,21 +648,20 @@ def ru_date(now: datetime) -> str:
     return f"{RU_DAYS[now.weekday()]} {now.day} {RU_MONTHS[now.month - 1]}, {now:%H:%M}"
 
 
-def stock_block(emoji: str, title: str, items: list, expected: dict, rub: bool) -> str:
+def stock_block(emoji: str, title: str, items: list, rub: bool) -> str:
     lines = [f"{emoji} <b>{title}</b>"]
     for i, r in enumerate(items, 1):
-        exp = expected.get(r["ticker"])
-        exp_txt = fmt_pct(exp) if exp is not None else "н/д"
         lines.append(f"{i}. <b>{esc(r['ticker'])}</b> · {fmt_price(r['price'], rub)}")
-        lines.append(f"    {arrow(r['day'])} <b>{fmt_pct(r['day'])}</b> за сегодня · ожидаем ещё {exp_txt}")
-        lines.append(f"    <i>за месяц было {fmt_pct(r['month'])} · за год было {fmt_pct(r['year'])}</i>")
+        lines.append(
+            f"    {arrow(r['day'])} <b>{fmt_pct(r['day'])}</b> за день "
+            f"(за месяц {fmt_pct(r['month'])} · за год {fmt_pct(r['year'])})"
+        )
     return "\n".join(lines)
 
 
 def build_message(now, us_top, us_worst, us_sell, ru_top, ru_worst, ru_sell,
                   btc, agg, news, quote=None, ru_failed=False) -> str:
     quote = quote or random.choice(QUOTES)
-    exp = agg["expected"]
 
     def assemble(news_count: int, item_limit: int) -> str:
         parts = [f"📊 <b>Слоп Отчёт</b> · {ru_date(now)} {TZ_LABEL}"]
@@ -677,7 +676,7 @@ def build_message(now, us_top, us_worst, us_sell, ru_top, ru_worst, ru_sell,
         for emoji, title, items, rub in blocks:
             picked = items[:item_limit]
             if picked:
-                parts.append(stock_block(emoji, title, picked, exp, rub=rub))
+                parts.append(stock_block(emoji, title, picked, rub=rub))
         if ru_failed:
             parts.append("⚠️ <i>Местные акции: Мосбиржа не отдала данные, смотри лог</i>")
 
